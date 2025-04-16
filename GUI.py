@@ -8,7 +8,7 @@
 
 import tkinter as tk
 from tkinter import ttk
-from sense_hat import SenseHat
+from sense_hat_c import SenseHatC  # Updated for Sense HAT (C)
 try:
     from ballistics import simulate_trajectory, BULLETS
 except ImportError:
@@ -35,8 +35,27 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# --- Sense HAT ---
-sense = SenseHat()
+# --- Sense HAT C Initialization ---
+sense = SenseHatC()
+
+# --- Orientation Helpers for Sense HAT C ---
+def get_pitch_roll():
+    accel = sense.get_accelerometer()
+    x = accel.get('x', 0.0)
+    y = accel.get('y', 0.0)
+    z = accel.get('z', 0.0)
+    denom_pitch = math.sqrt(y**2 + z**2) or 1e-6
+    denom_roll = z if z != 0 else 1e-6
+    pitch = math.degrees(math.atan2(x, denom_pitch))
+    roll = math.degrees(math.atan2(y, denom_roll))
+    return pitch, roll
+
+def get_heading():
+    mag = sense.get_magnetometer()
+    heading = math.degrees(math.atan2(mag['y'], mag['x']))
+    if heading < 0:
+        heading += 360
+    return heading
 
 # --- Globals ---
 latest_temp = latest_pressure = latest_humidity = 0
@@ -62,10 +81,31 @@ wind_input_file = 'wind_input.json'
 import atexit
 
 # --- GPIO Setup ---
+# --- GPIO Setup ---
+GPIO.setmode(GPIO.BCM)
+
+# --- External Button ---
 man_button = 17  # External manual trigger button
+GPIO.setup(man_button, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# --- KEY Buttons on Waveshare 1.44" TFT HAT ---
 button1 = Button(21)  # KEY1: Select
 button2 = Button(20)  # KEY2: Back
 button3 = Button(16)  # KEY3: Toggle Mode
+
+# --- Joystick GPIO Pins for 1.44" TFT Screen HAT ---
+JOYSTICK_UP = 6
+JOYSTICK_DOWN = 19
+JOYSTICK_LEFT = 5
+JOYSTICK_RIGHT = 26
+JOYSTICK_PRESS = 13  # Not used yet, but reserved
+
+GPIO.setup(JOYSTICK_UP, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(JOYSTICK_DOWN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(JOYSTICK_LEFT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(JOYSTICK_RIGHT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(JOYSTICK_PRESS, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
 
 # --- SPI Setup (Waveshare screen) ---
 spi = spidev.SpiDev()
@@ -96,114 +136,199 @@ atexit.register(GPIO.cleanup)
 update_lock = threading.Lock()
 continuous_thread = None
 
-# --- Proceed to Part 2 for GUI Layout & Field Highlighting ---
-# PART 2/7 — GUI Layout, Splash Screen, Calibration Loading, First Launch Checks
 
-# --- Initialize GUI Root ---
-root = tk.Tk()
-root.title("RAT 9 Ballistics Calculator")
-main = ttk.Frame(root, padding="10")
-main.pack()
+# PART 2/7a — Display Labels, Sensor Polling, Wind Persistence, UART Rangefinder
 
-# --- Style Configuration ---
-style = ttk.Style()
-style.configure("TLabel", font=("Helvetica", 10))
-style.configure("Highlighted.TLabel", font=("Helvetica", 10, "bold"))
+# --- Update GUI Labels with Ballistics Info ---
+def update_display_labels(labels):
+    labels['time_of_flight'].config(text=current_ballistics_info['time_of_flight'])
+    labels['drop'].config(text=current_ballistics_info['drop'])
+    labels['mil_adjustment'].config(text=current_ballistics_info['mil_adjustment'])
+    labels['wind_drift'].config(text=current_ballistics_info['wind_drift'])
+    labels['range'].config(text=current_ballistics_info['range'])
+    labels['atmospheric'].config(text=current_ballistics_info['atmospheric'])
 
-# --- Splash Screen ---
-def show_splash_screen():
-    splash = tk.Toplevel(root)
-    splash.title("Initializing")
-    ttk.Label(splash, text="RAT 9 Ballistics Calculator\nInitializing Sensors...", font=("Helvetica", 14)).pack(padx=20, pady=20)
-    splash.update()
-    time.sleep(1.5)
-    splash.destroy()
+# --- Read and Average Environmental Data from Sense HAT C ---
+def get_average_atmospheric_conditions():
+    global latest_temp, latest_pressure, latest_humidity
 
-# --- Safe Mode Warning ---
-def safe_screen(message):
-    safe_win = tk.Toplevel(root)
-    safe_win.title("Safe Mode")
-    ttk.Label(safe_win, text=message, font=("Helvetica", 12), wraplength=300).pack(padx=20, pady=20)
-    ttk.Button(safe_win, text="Exit", command=root.destroy).pack(pady=10)
-    safe_win.grab_set()
-    root.wait_window(safe_win)
+    temp_sum = 0
+    pressure_sum = 0
+    humidity_sum = 0
 
-# --- First-Time Launch Instruction ---
-def show_first_launch():
-    welcome = tk.Toplevel(root)
-    welcome.title("Welcome")
-    ttk.Label(welcome, text="Welcome to RAT 9 Ballistics.\n\nIf this is your first time using the device,\nplease calibrate the pitch/roll and compass\nbefore beginning.\n\nUse the joystick to navigate.\nPress KEY1 to enter selections.", font=("Helvetica", 10), wraplength=300).pack(pady=10)
-    ttk.Button(welcome, text="Got it!", command=welcome.destroy).pack(pady=5)
+    for _ in range(3):
+        try:
+            temp_sum += sense.get_temperature()
+            pressure_sum += sense.get_pressure()
+            humidity_sum += sense.get_humidity()
+        except Exception as e:
+            logging.warning("Sensor read failed: %s", e)
+            continue
+        time.sleep(0.5)  # Short delay between reads for stability
 
-# --- Calibration Loaders ---
-def load_calibration():
-    global initial_pitch, initial_roll
-    if os.path.exists(calibration_file):
-        with open(calibration_file, 'r') as f:
-            pitch, roll = f.read().strip().split(',')
-            initial_pitch = float(pitch)
-            initial_roll = float(roll)
+    latest_temp = temp_sum / 3
+    latest_pressure = pressure_sum / 3
+    latest_humidity = humidity_sum / 3
+
+    return latest_temp, latest_pressure, latest_humidity
+
+# --- Wind Input Persistence (load and save from file) ---
+def load_wind_inputs():
+    global wind_speed, wind_angle
+    if os.path.exists(wind_input_file):
+        try:
+            with open(wind_input_file, 'r') as f:
+                data = json.load(f)
+                wind_speed = data.get('wind_speed', 0.0)
+                wind_angle = data.get('wind_angle', 0.0)
+        except Exception as e:
+            logging.warning("Failed to load wind input file: %s", e)
 
 
-def load_compass_heading():
-    global heading_offset
+def save_wind_inputs():
+    global wind_speed, wind_angle
+    data = {'wind_speed': wind_speed, 'wind_angle': wind_angle}
     try:
-        if os.path.exists('compass_cal.txt'):
-            with open('compass_cal.txt', 'r') as f:
-                heading_offset = float(f.read())
-    except:
-        heading_offset = 0
-        logging.warning("Compass calibration not found. Defaulting heading offset to 0°.")
-
-# --- Hardware Availability Check ---
-def verify_hardware():
-    try:
-        _ = sense.get_temperature()
+        with open(wind_input_file, 'w') as f:
+            json.dump(data, f)
     except Exception as e:
-        logging.critical("Sense HAT error: %s", e)
-        safe_screen("Sense HAT not found.\n\nPlease check connection and reboot.")
+        logging.warning("Failed to save wind input file: %s", e)
 
-# --- Launch Initialization ---
-show_splash_screen()
-verify_hardware()
-load_calibration()
-load_compass_heading()
-if not os.path.exists(calibration_file) or not os.path.exists('compass_cal.txt'):
-    show_first_launch()
+# --- UART-Based Rangefinder Data Retrieval ---
+def get_range():
+    try:
+        if ser and ser.in_waiting > 0:
+            range_data = ser.readline().decode('utf-8').strip()
+            range_value = int(range_data)
+            return range_value
+    except Exception as e:
+        logging.warning("Rangefinder read error: %s", e)
+    return 0
 
-# Proceed to Part 3 for UI layout and ballistics field rendering
+# --- Placeholder for Progress Feedback (used later during calculations) ---
+def show_progress_indicator():
+    print("Processing...")  # To be expanded with graphical feedback in GUI later
+
+# PART 2/7b — Joystick Navigation, Button Logic, Field Highlighting, Input Control
+
+# --- Field Input State and Joystick Input Modes ---
+field_values = {
+    'bullet': list(BULLETS.keys()),
+    'wind_speed': wind_speed,
+    'wind_direction': wind_angle
+}
+
+highlighted_field_index = 0  # Keeps track of which field is selected
+fields = ['bullet', 'wind_speed', 'wind_direction']
+
+# --- Joystick Direction Mapping (for GPIO or hat-based joystick logic) ---
+def move_highlight(direction):
+    global highlighted_field_index
+    if direction == 'up':
+        highlighted_field_index = (highlighted_field_index - 1) % len(fields)
+    elif direction == 'down':
+        highlighted_field_index = (highlighted_field_index + 1) % len(fields)
+
+# --- Field Value Modification ---
+def adjust_field_value(direction):
+    global wind_speed, wind_angle, selected_bullet
+    field = fields[highlighted_field_index]
+
+    if field == 'wind_speed':
+        if direction == 'left':
+            wind_speed = max(0.0, wind_speed - 0.1)
+        elif direction == 'right':
+            wind_speed += 0.1
+        elif direction == 'up':
+            wind_speed += 0.5
+        elif direction == 'down':
+            wind_speed = max(0.0, wind_speed - 0.5)
+
+    elif field == 'wind_direction':
+        if direction == 'left':
+            wind_angle = (wind_angle - 5) % 360
+        elif direction == 'right':
+            wind_angle = (wind_angle + 5) % 360
+        elif direction == 'up':
+            wind_angle = (wind_angle + 15) % 360
+        elif direction == 'down':
+            wind_angle = (wind_angle - 15) % 360
+
+    elif field == 'bullet':
+        current_idx = field_values['bullet'].index(selected_bullet)
+        if direction == 'left':
+            selected_bullet = field_values['bullet'][(current_idx - 1) % len(field_values['bullet'])]
+        elif direction == 'right':
+            selected_bullet = field_values['bullet'][(current_idx + 1) % len(field_values['bullet'])]
+
+# --- Menu Navigation Buttons ---
+def handle_button1_press():
+    # Selects current highlighted field or confirms selection
+    print(f"Button 1 (Select) pressed for: {fields[highlighted_field_index]}")
+
+def handle_button2_press():
+    # Back or exit submenu
+    print("Button 2 (Back) pressed")
+
+def handle_button3_press():
+    global mode
+    # Toggle between modes
+    if mode == "manual":
+        mode = "continuous"
+    else:
+        mode = "manual"
+    print(f"Button 3 (Mode toggle) pressed, mode is now: {mode}")
+
+# --- Attach Buttons to Handlers ---
+button1.when_pressed = handle_button1_press
+button2.when_pressed = handle_button2_press
+button3.when_pressed = handle_button3_press
+
+# --- Joystick Handler Placeholder ---
+def on_joystick_input(direction):
+    if direction in ['up', 'down']:
+        move_highlight(direction)
+    elif direction in ['left', 'right']:
+        adjust_field_value(direction)
+
+# --- Field Highlighting (visual feedback) ---
+def get_highlighted_field():
+    return fields[highlighted_field_index]
+
+
+
 # PART 3/7 — GUI Field Layout, Ballistics Info, Bullet Selector, Wind Inputs
 
 # --- GUI Field + Widget Setup ---
 bullet_choice = ttk.Combobox(main, values=list(BULLETS.keys()))
 bullet_choice.set(".308_M80")
-bullet_choice.grid(row=0, column=1, sticky='w')
+bullet_choice.grid(row=0, column=1, sticky='w', padx=5, pady=2)
 
 field_labels = {}
 info_labels = {}
 field_order = ['bullet', 'wind_speed', 'wind_direction']
 
 # --- Bullet Field ---
-ttk.Label(main, text="Bullet Type:").grid(row=0, column=0, sticky='e')
+ttk.Label(main, text="Bullet Type:").grid(row=0, column=0, sticky='e', padx=5, pady=2)
 field_labels['bullet'] = ttk.Label(main, text=bullet_choice.get())
-field_labels['bullet'].grid(row=0, column=2, sticky='w')
+field_labels['bullet'].grid(row=0, column=2, sticky='w', padx=5, pady=2)
 
 # --- Wind Speed Field ---
-ttk.Label(main, text="Wind Speed (m/s):").grid(row=1, column=0, sticky='e')
-field_labels['wind_speed'] = ttk.Label(main, text=f"{wind_speed:.2f}")
-field_labels['wind_speed'].grid(row=1, column=1, sticky='w')
+ttk.Label(main, text="Wind Speed (m/s):").grid(row=1, column=0, sticky='e', padx=5, pady=2)
+field_labels['wind_speed'] = ttk.Label(main, text=f"{wind_speed:.2f} m/s")
+field_labels['wind_speed'].grid(row=1, column=1, sticky='w', padx=5, pady=2)
 
 # --- Wind Direction Field ---
-ttk.Label(main, text="Wind Angle (deg):").grid(row=2, column=0, sticky='e')
-field_labels['wind_direction'] = ttk.Label(main, text=f"{wind_angle:.2f}")
-field_labels['wind_direction'].grid(row=2, column=1, sticky='w')
+ttk.Label(main, text="Wind Angle (deg):").grid(row=2, column=0, sticky='e', padx=5, pady=2)
+field_labels['wind_direction'] = ttk.Label(main, text=f"{wind_angle:.2f}°")
+field_labels['wind_direction'].grid(row=2, column=1, sticky='w', padx=5, pady=2)
 
 # --- Ballistics Output Labels ---
 output_keys = ['time_of_flight', 'drop', 'mil_adjustment', 'wind_drift', 'range', 'atmospheric']
 for i, key in enumerate(output_keys, start=3):
-    ttk.Label(main, text=key.replace('_', ' ').title() + ":").grid(row=i, column=0, sticky='e')
+    ttk.Label(main, text=key.replace('_', ' ').title() + ":").grid(row=i, column=0, sticky='e', padx=5, pady=2)
     info_labels[key] = ttk.Label(main, text="...")
-    info_labels[key].grid(row=i, column=1, columnspan=2, sticky='w')
+    info_labels[key].grid(row=i, column=1, columnspan=2, sticky='w', padx=5, pady=2)
 
 # --- Progress Label for status messages ---
 progress_label = ttk.Label(main, text="")
@@ -211,8 +336,8 @@ progress_label.grid(row=10, column=0, columnspan=3, pady=(10, 0))
 
 # --- Function to Refresh Output Info Display ---
 def update_display():
-    field_labels['wind_speed'].config(text=f"{wind_speed:.2f}")
-    field_labels['wind_direction'].config(text=f"{wind_angle:.2f}")
+    field_labels['wind_speed'].config(text=f"{wind_speed:.2f} m/s")
+    field_labels['wind_direction'].config(text=f"{wind_angle:.2f}°")
     field_labels['bullet'].config(text=bullet_choice.get())
     for key in info_labels:
         info_labels[key].config(text=current_ballistics_info.get(key, '...'))
@@ -230,123 +355,120 @@ bullet_choice.bind("<<ComboboxSelected>>", on_bullet_select)
 
 # --- Proceed to Part 4: Joystick Navigation, Highlighting, and Field Modification ---
 
-# PATCHED PART 4 — Joystick Navigation + Modify Mode Control
+# PART 4a/7 — Joystick Navigation, Field Highlighting, and Field Value Editing
 
-# --- Highlight Logic ---
-modify_mode = False
+import time
 
+last_toggle = 0  # For debounce timing on mode toggle
+highlighted_field_index = 0  # Track selected field
+highlight_field()  # Ensure the first field is highlighted at startup
+
+# --- Highlight Field with Blue Color ---
 def highlight_field():
-    for i, key in enumerate(field_order):
-        label = field_labels[key] if key != 'bullet' else bullet_choice
-        style = ("Helvetica", 12, "bold") if i == highlighted_field_index else ("Helvetica", 10)
-        fg = "blue" if i == highlighted_field_index and modify_mode else "green" if i == highlighted_field_index else "black"
-        label.config(font=style, foreground=fg)
+    for i, field in enumerate(field_order):
+        if i == highlighted_field_index:
+            field_labels[field].config(background="lightblue")
+        else:
+            field_labels[field].config(background="SystemButtonFace")
 
-# --- Joystick Pins ---
-joystick_up_pin = 5
-joystick_down_pin = 6
-joystick_left_pin = 13
-joystick_right_pin = 19
-
-GPIO.setup(joystick_up_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(joystick_down_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(joystick_left_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(joystick_right_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# --- Joystick Navigation Logic ---
-def joystick_up(channel=None):
-    if modify_mode:
-        modify_selected_field("up")
-    else:
-        global highlighted_field_index
+# --- Field Navigation ---
+def navigate_fields(direction):
+    global highlighted_field_index
+    if direction == 'up':
         highlighted_field_index = (highlighted_field_index - 1) % len(field_order)
-        highlight_field()
-update_display()
-root.mainloop()
-GPIO.cleanup()
-
-def joystick_down(channel=None):
-    if modify_mode:
-        modify_selected_field("down")
-    else:
-        global highlighted_field_index
+    elif direction == 'down':
         highlighted_field_index = (highlighted_field_index + 1) % len(field_order)
-        highlight_field()
+    print(f"Navigated to field: {field_order[highlighted_field_index]}")
+    highlight_field()
 
-def joystick_left(channel=None):
-    if modify_mode:
-        modify_selected_field("left")
-
-def joystick_right(channel=None):
-    if modify_mode:
-        modify_selected_field("right")
-      
-joystick_pins = [joystick_up_pin, joystick_down_pin, joystick_left_pin, joystick_right_pin]
-
-def debounce_wrapper(func):
-    def wrapper(channel):
-        GPIO.remove_event_detect(channel)
-        func(channel)
-        GPIO.add_event_detect(channel, GPIO.FALLING, callback=wrapper, bouncetime=200)
-    return wrapper
-
-GPIO.add_event_detect(joystick_up_pin, GPIO.FALLING, callback=debounce_wrapper(joystick_up), bouncetime=200)
-GPIO.add_event_detect(joystick_down_pin, GPIO.FALLING, callback=debounce_wrapper(joystick_down), bouncetime=200)
-GPIO.add_event_detect(joystick_left_pin, GPIO.FALLING, callback=debounce_wrapper(joystick_left), bouncetime=200)
-GPIO.add_event_detect(joystick_right_pin, GPIO.FALLING, callback=debounce_wrapper(joystick_right), bouncetime=200)
-
-
-# --- Field Modifier ---
-def modify_selected_field(direction):
-    global wind_speed, wind_angle
+# --- Field Adjustment (Small = Left/Right, Large = Up/Down) ---
+def modify_field_value(direction):
+    global wind_speed, wind_angle, selected_bullet
     field = field_order[highlighted_field_index]
-    small_step = 0.1
-    large_step = 1.0
-    small_angle = 5
-    large_angle = 15
 
     if field == 'wind_speed':
-        step = large_step if direction in ("up", "down") else small_step
-        delta = step if direction in ("right", "down") else -step
-        wind_speed = max(0.0, wind_speed + delta)
+        if direction == 'left':
+            wind_speed = max(0.0, wind_speed - 0.1)
+        elif direction == 'right':
+            wind_speed = min(30.0, wind_speed + 0.1)
+        elif direction == 'up':
+            wind_speed = min(30.0, wind_speed + 0.5)
+        elif direction == 'down':
+            wind_speed = max(0.0, wind_speed - 0.5)
+        print(f"Wind speed adjusted: {wind_speed:.2f} m/s")
+
     elif field == 'wind_direction':
-        step = large_angle if direction in ("up", "down") else small_angle
-        delta = step if direction in ("right", "down") else -step
-        wind_angle = (wind_angle + delta) % 360
+        if direction == 'left':
+            wind_angle = (wind_angle - 5) % 360
+        elif direction == 'right':
+            wind_angle = (wind_angle + 5) % 360
+        elif direction == 'up':
+            wind_angle = (wind_angle + 15) % 360
+        elif direction == 'down':
+            wind_angle = (wind_angle - 15) % 360
+        print(f"Wind direction adjusted: {wind_angle:.2f}°")
 
-    save_settings()
-    update_display()
-
-# --- Key Bindings ---
-def key1_pressed():
-    global modify_mode
-    field = field_order[highlighted_field_index]
-    if field in ["wind_speed", "wind_direction"]:
-        modify_mode = not modify_mode
-        highlight_field()
-    elif field == "bullet":
+    elif field == 'bullet':
+        keys = list(BULLETS.keys())
+        current_idx = keys.index(bullet_choice.get())
+        if direction == 'left':
+            bullet_choice.set(keys[(current_idx - 1) % len(keys)])
+        elif direction == 'right':
+            bullet_choice.set(keys[(current_idx + 1) % len(keys)])
         on_bullet_select()
+        print(f"Bullet changed to: {bullet_choice.get()}")
 
-def key2_pressed():
-    global modify_mode
-    if modify_mode:
-        modify_mode = False
-        highlight_field()
-    else:
-        update_display()
-
-def key3_pressed():
-    global mode
-    mode = 'manual' if mode == 'continuous' else 'continuous'
     update_display()
-    if mode == 'continuous':
-        schedule_continuous_updates()
-      
-button1.when_pressed = key1_pressed
-button2.when_pressed = key2_pressed
-button3.when_pressed = key3_pressed
+    highlight_field()
 
-highlight_field()
+
+4B
+
+# PART 4b/7 — Button Logic, Joystick Input Routing, and GPIO Event Detection
+
+# --- Button 1 (KEY1): Select Current Field ---
+def on_button1_press():
+    print("KEY1 (Select) pressed")
+    update_display()
+    highlight_field()
+
+# --- Button 2 (KEY2): Back or Cancel ---
+def on_button2_press():
+    print("KEY2 (Back) pressed")
+    # Reserved for submenu/back navigation in future
+
+# --- Button 3 (KEY3): Toggle Between Manual and Continuous Mode ---
+def on_button3_press():
+    global mode, last_toggle
+    now = time.time()
+    if now - last_toggle > 0.5:  # debounce period
+        mode = "continuous" if mode == "manual" else "manual"
+        print(f"KEY3 (Mode toggle): Mode switched to {mode}")
+        last_toggle = now
+
+# --- GPIO Bindings for Buttons ---
+button1.when_pressed = on_button1_press
+button2.when_pressed = on_button2_press
+button3.when_pressed = on_button3_press
+
+# --- Joystick Input Dispatcher ---
+def joystick_input(direction):
+    if direction in ['up', 'down']:
+        navigate_fields(direction)
+    elif direction in ['left', 'right']:
+        modify_field_value(direction)
+
+# --- Register Joystick GPIO Events ---
+GPIO.add_event_detect(JOYSTICK_UP, GPIO.FALLING, callback=lambda ch: joystick_input('up'), bouncetime=150)
+GPIO.add_event_detect(JOYSTICK_DOWN, GPIO.FALLING, callback=lambda ch: joystick_input('down'), bouncetime=150)
+GPIO.add_event_detect(JOYSTICK_LEFT, GPIO.FALLING, callback=lambda ch: joystick_input('left'), bouncetime=150)
+GPIO.add_event_detect(JOYSTICK_RIGHT, GPIO.FALLING, callback=lambda ch: joystick_input('right'), bouncetime=150)
+
+# --- Developer Note ---
+# Joystick GPIO callbacks are now active. Movement will automatically trigger navigation or editing.
+# Joystick press (GPIO 13) is reserved for future functionality.
+
+
 # PART 5/7 — Ballistics Calculation, Sensor Sync, Rangefinding, Environmental Averaging
 
 # --- Atmospheric Sensor Sampling (3 reads every 30s) ---
@@ -457,7 +579,7 @@ def schedule_continuous_updates():
                     root.after(1500, lambda: progress_label.config(text=""))
                 finally:
                     update_lock.release()
-            time.sleep(3)
+            time.sleep(3)  # Continuous update interval
 
     if continuous_thread is None or not continuous_thread.is_alive():
         continuous_thread = threading.Thread(target=loop, daemon=True)
@@ -475,7 +597,17 @@ root.protocol("WM_DELETE_WINDOW", graceful_exit)
 highlight_field()
 update_display()
 
+# --- Confirm Sensor Access and Initial Sync ---
+try:
+    heading = get_heading()
+    pitch, roll = get_pitch_roll()
+    logging.info(f"Initial orientation: Pitch={pitch:.2f}, Roll={roll:.2f}, Heading={heading:.2f}")
+except Exception as e:
+    logging.warning(f"Sensor read error at launch: {e}")
+    progress_label.config(text="⚠️ Sensor error. Check calibration or connection.")
+
 # --- Proceed to Part 7: Final Touches, Calibration Mode, Wind Menu, Splash, Logging, and Export ---
+
 # PART 7/7 — Calibration UI, Wind Menu, Final Logging, Wrap-up
 
 # --- Wind Settings Window ---
